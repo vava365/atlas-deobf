@@ -47,6 +47,12 @@ local CFG = {
     webhook = (typeof(_G.webhook) == "string") and _G.webhook or nil,
     notify = (typeof(_G.notify) == "boolean") and _G.notify or true,
     detecttimeout = tonumber(_G.detecttimeout) or 25,
+    autovicious = (typeof(_G.autovicious) == "boolean") and _G.autovicious or false,
+    autosprouts = (typeof(_G.autosprouts) == "boolean") and _G.autosprouts or false,
+    collecttokens = true,
+    tokenradius = tonumber(_G.tokenradius) or 75,
+    vicioustime = tonumber(_G.vicioustime) or 180,
+    sprouttime = tonumber(_G.sprouttime) or 120,
 
     vicious = (typeof(_G.vicious) == "boolean") and _G.vicious or false,
     giftedonly = (typeof(_G.giftedonly) == "boolean") and _G.giftedonly or false,
@@ -201,9 +207,9 @@ local function mapSproutRarity(name)
     if string.find(name, "gummy") then return "Gummy" end
     if string.find(name, "moon") then return "Moon" end
     if string.find(name, "rare") then return "Rare" end
-    if string.find(name, "epic") or string.find(name, "legend") or string.find(name, "supreme") then
-        return "Epic+"
-    end
+    if string.find(name, "supreme") then return "Supreme" end
+    if string.find(name, "legend") then return "Legendary" end
+    if string.find(name, "epic") then return "Epic" end
     return "Basic"
 end
 
@@ -215,7 +221,11 @@ local function findSprouts()
             local pos = instancePosition(inst)
             local field = nearestFieldName(pos)
             local rarity = mapSproutRarity(inst.Name)
-            if CFG.rarity[rarity] and not inBlacklist(field) then
+            local allow = CFG.rarity[rarity]
+            if not allow and (rarity == "Epic" or rarity == "Legendary" or rarity == "Supreme") then
+                allow = CFG.rarity["Epic+"]
+            end
+            if allow and not inBlacklist(field) then
                 table.insert(results, { kind = "sprout", rarity = rarity, field = field, pos = pos })
             end
         end
@@ -456,6 +466,123 @@ local function applyMovementSettings()
     end
 end
 
+-- Movement and farming helpers
+local function getHumanoid()
+    local char = ensureCharacter()
+    if not char then return nil end
+    return char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getHRP()
+    local char = ensureCharacter()
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
+end
+
+local function moveToPosition(pos, timeout)
+    local hum = getHumanoid()
+    local hrp = getHRP()
+    if not hum or not hrp or not pos then return false end
+    local reached = false
+    pcall(function()
+        hum:MoveTo(pos)
+    end)
+    local conn
+    conn = hum.MoveToFinished:Connect(function(r)
+        reached = r
+    end)
+    local t0 = tick()
+    while tick() - t0 < (timeout or 6) and not reached do
+        if (hrp.Position - pos).Magnitude < 3 then
+            reached = true
+            break
+        end
+        task.wait(0.1)
+    end
+    if conn then conn:Disconnect() end
+    return reached
+end
+
+local function findNearestToken(center, radius)
+    local folder = Workspace:FindFirstChild("Tokens") or Workspace
+    local nearest, bestDist
+    for _, inst in ipairs(folder:GetDescendants()) do
+        if inst:IsA("BasePart") and string.lower(inst.Name) == "token" then
+            local pos = inst.Position
+            local d = (pos - center).Magnitude
+            if d <= (radius or 75) then
+                if not nearest or d < bestDist then
+                    nearest, bestDist = inst, d
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function collectTokens(duration, aroundPos, radius)
+    local hrp = getHRP()
+    local tEnd = tick() + (duration or 10)
+    while tick() < tEnd do
+        local origin = (aroundPos or (hrp and hrp.Position))
+        if not origin then break end
+        local tok = findNearestToken(origin, radius or CFG.tokenradius)
+        if tok and tok:IsA("BasePart") then
+            moveToPosition(tok.Position, 4)
+        else
+            task.wait(0.25)
+        end
+    end
+end
+
+local function locateViciousNear(pos)
+    local nearest, best = nil, math.huge
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("Model") then
+            local name = string.lower(inst.Name)
+            if string.find(name, "vicious") and string.find(name, "bee") then
+                local ip = instancePosition(inst)
+                if ip then
+                    local d = (ip - pos).Magnitude
+                    if d < best then
+                        nearest, best = inst, d
+                    end
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function engageVicious(result)
+    local startPos = result.pos or (getHRP() and getHRP().Position) or Vector3.new()
+    local target = locateViciousNear(startPos)
+    local tEnd = tick() + (CFG.vicioustime or 180)
+    while tick() < tEnd do
+        if not target or not target.Parent then break end
+        local bpos = instancePosition(target)
+        if not bpos then break end
+        moveToPosition(bpos, 2)
+        collectTokens(1.5, bpos, math.min(50, CFG.tokenradius or 75))
+        -- Reacquire in case the model reference changes
+        target = locateViciousNear(bpos)
+    end
+    collectTokens(10, (getHRP() and getHRP().Position) or startPos, CFG.tokenradius)
+end
+
+local function farmSprout(result)
+    local targetPos = result.pos
+    if targetPos then
+        moveToPosition(targetPos, 8)
+    end
+    local duration = CFG.sprouttime or 120
+    local tEnd = tick() + duration
+    while tick() < tEnd do
+        collectTokens(2, targetPos or (getHRP() and getHRP().Position) or Vector3.new(), CFG.tokenradius)
+        task.wait(0.2)
+    end
+end
+
 -- Main hop logic
 local function waitForTargets()
     -- Wait some time for assets to spawn, periodically scanning
@@ -464,6 +591,15 @@ local function waitForTargets()
         local found = detectTargets()
         if #found > 0 then
             announceFound(found[1])
+            -- Optional autopilot
+            pcall(function()
+                local f = found[1]
+                if f.kind == "vicious" and CFG.autovicious then
+                    engageVicious(f)
+                elseif f.kind == "sprout" and CFG.autosprouts then
+                    farmSprout(f)
+                end
+            end)
             return true, found
         end
         task.wait(1)
