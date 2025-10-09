@@ -30,6 +30,7 @@ local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
+local StarterGui = game:GetService("StarterGui")
 
 local LocalPlayer = Players.LocalPlayer
 local PLACE_ID = game.PlaceId
@@ -44,6 +45,7 @@ local CFG = {
     blacklistedfields = (typeof(_G.blacklistedfields) == "table") and _G.blacklistedfields or {},
     fireflies = (typeof(_G.fireflies) == "boolean") and _G.fireflies or false,
     webhook = (typeof(_G.webhook) == "string") and _G.webhook or nil,
+    notify = (typeof(_G.notify) == "boolean") and _G.notify or true,
 
     vicious = (typeof(_G.vicious) == "boolean") and _G.vicious or false,
     giftedonly = (typeof(_G.giftedonly) == "boolean") and _G.giftedonly or false,
@@ -336,6 +338,18 @@ local function sendWebhook(payload)
     requester({ Url = CFG.webhook, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = data })
 end
 
+-- Client notification helper
+local function pushNotification(title, text, duration)
+    if not CFG.notify then return end
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = duration or 15
+        })
+    end)
+end
+
 local function announceFound(result)
     local title
     if result.kind == "sprout" then
@@ -351,6 +365,7 @@ local function announceFound(result)
     end
 
     local link = toServerLink(PLACE_ID, CURRENT_JOB_ID)
+    pushNotification(title, string.format("Field: %s\nJobId: %s", tostring(result.field), tostring(CURRENT_JOB_ID)), 20)
     local embed = {
         username = "BSS ServerHop",
         embeds = {
