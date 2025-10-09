@@ -47,6 +47,12 @@ local CFG = {
     webhook = (typeof(_G.webhook) == "string") and _G.webhook or nil,
     notify = (typeof(_G.notify) == "boolean") and _G.notify or true,
     detecttimeout = tonumber(_G.detecttimeout) or 25,
+    autovicious = (typeof(_G.autovicious) == "boolean") and _G.autovicious or false,
+    autosprouts = (typeof(_G.autosprouts) == "boolean") and _G.autosprouts or false,
+    collecttokens = true,
+    tokenradius = tonumber(_G.tokenradius) or 75,
+    vicioustime = tonumber(_G.vicioustime) or 180,
+    sprouttime = tonumber(_G.sprouttime) or 120,
 
     vicious = (typeof(_G.vicious) == "boolean") and _G.vicious or false,
     giftedonly = (typeof(_G.giftedonly) == "boolean") and _G.giftedonly or false,
@@ -67,6 +73,11 @@ local HOP = {
     maxHopAttempts = 50,       -- maximum number of servers to try
     perServerDetectTimeout = CFG.detecttimeout, -- seconds to wait in a server for targets to load
     retryTeleportDelay = 2,    -- seconds between teleport retries
+    -- Anti-stall settings
+    maxNilPicks = 3,
+    clearVisitedOnStall = true,
+    forceRandomTeleportOnStall = true,
+    maxVisited = 1500,
     persistenceFile = "serverhop_visited.json",
 }
 
@@ -125,6 +136,28 @@ end
 
 local function saveVisited()
     safeWriteFile(HOP.persistenceFile, HttpService:JSONEncode(visited))
+end
+
+local function countVisited()
+    local n = 0
+    for _ in pairs(visited) do n = n + 1 end
+    return n
+end
+
+local function maybeTrimVisited()
+    if countVisited() > (HOP.maxVisited or 1500) then
+        visited = {}
+        saveVisited()
+    end
+end
+
+local function clearVisitedIfStalled(stallCount)
+    if HOP.clearVisitedOnStall and stallCount >= (HOP.maxNilPicks or 3) then
+        visited = {}
+        saveVisited()
+        return true
+    end
+    return false
 end
 
 -- Helpers
@@ -201,9 +234,9 @@ local function mapSproutRarity(name)
     if string.find(name, "gummy") then return "Gummy" end
     if string.find(name, "moon") then return "Moon" end
     if string.find(name, "rare") then return "Rare" end
-    if string.find(name, "epic") or string.find(name, "legend") or string.find(name, "supreme") then
-        return "Epic+"
-    end
+    if string.find(name, "supreme") then return "Supreme" end
+    if string.find(name, "legend") then return "Legendary" end
+    if string.find(name, "epic") then return "Epic" end
     return "Basic"
 end
 
@@ -215,7 +248,11 @@ local function findSprouts()
             local pos = instancePosition(inst)
             local field = nearestFieldName(pos)
             local rarity = mapSproutRarity(inst.Name)
-            if CFG.rarity[rarity] and not inBlacklist(field) then
+            local allow = CFG.rarity[rarity]
+            if not allow and (rarity == "Epic" or rarity == "Legendary" or rarity == "Supreme") then
+                allow = CFG.rarity["Epic+"]
+            end
+            if allow and not inBlacklist(field) then
                 table.insert(results, { kind = "sprout", rarity = rarity, field = field, pos = pos })
             end
         end
@@ -494,7 +531,6 @@ local function moveToPosition(pos, timeout)
 end
 
 local function findNearestToken(center, radius)
-    if not CFG.collecttokens then return nil end
     local folder = Workspace:FindFirstChild("Tokens") or Workspace
     local nearest, bestDist
     for _, inst in ipairs(folder:GetDescendants()) do
@@ -512,7 +548,6 @@ local function findNearestToken(center, radius)
 end
 
 local function collectTokens(duration, aroundPos, radius)
-    if not CFG.collecttokens then return end
     local hrp = getHRP()
     local tEnd = tick() + (duration or 10)
     while tick() < tEnd do
@@ -555,15 +590,11 @@ local function engageVicious(result)
         local bpos = instancePosition(target)
         if not bpos then break end
         moveToPosition(bpos, 2)
-        if CFG.collecttokens then
-            collectTokens(1.5, bpos, math.min(50, CFG.tokenradius or 75))
-        end
+        collectTokens(1.5, bpos, math.min(50, CFG.tokenradius or 75))
         -- Reacquire in case the model reference changes
         target = locateViciousNear(bpos)
     end
-    if CFG.collecttokens then
-        collectTokens(10, (getHRP() and getHRP().Position) or startPos, CFG.tokenradius)
-    end
+    collectTokens(10, (getHRP() and getHRP().Position) or startPos, CFG.tokenradius)
 end
 
 local function farmSprout(result)
@@ -605,6 +636,8 @@ end
 
 local function hop(placeId)
     applyMovementSettings()
+    local stallCount = 0
+    local preferLeast = HOP.preferLeastPlayers
 
     for attempt = 1, HOP.maxHopAttempts do
         -- Scan this server for targets first
@@ -615,14 +648,32 @@ local function hop(placeId)
         end
 
         -- Otherwise, hop to next server
-        local srv = pickServer(placeId, visited, HOP.preferLeastPlayers)
+        local srv = pickServer(placeId, visited, preferLeast)
         if not srv then
-            warn("ServerHop: no suitable server found on attempt", attempt)
+            stallCount = stallCount + 1
+            warn("ServerHop: no suitable server found on attempt", attempt, "stall", stallCount)
+            if clearVisitedIfStalled(stallCount) then
+                warn("ServerHop: cleared visited cache due to stall; switching to first-available mode")
+                preferLeast = false
+            end
+            if HOP.forceRandomTeleportOnStall and stallCount >= (HOP.maxNilPicks or 3) then
+                local okTp, err = pcall(function()
+                    -- Client-side fallback: no player argument
+                    TeleportService:Teleport(placeId)
+                end)
+                if okTp then
+                    return true
+                else
+                    warn("ServerHop: Random teleport failed:", err)
+                end
+            end
             task.wait(HOP.retryTeleportDelay)
         else
             local id = srv.id
+            stallCount = 0
             visited[id] = true
             saveVisited()
+            maybeTrimVisited()
 
             warn(string.format("ServerHop: teleporting to %s (%d/%d)", id, srv.playing or -1, srv.maxPlayers or -1))
 
@@ -641,8 +692,16 @@ local function hop(placeId)
             end
 
             if not teleported then
-                -- failed to teleport, try another server next loop
-                task.wait(HOP.retryTeleportDelay)
+                -- failed to teleport to a specific instance, try generic teleport as fallback
+                local okTp2, err2 = pcall(function()
+                    TeleportService:Teleport(placeId)
+                end)
+                if okTp2 then
+                    return true
+                else
+                    warn("ServerHop: Fallback Teleport failed:", err2)
+                    task.wait(HOP.retryTeleportDelay)
+                end
             else
                 return true
             end
