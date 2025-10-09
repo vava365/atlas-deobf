@@ -73,6 +73,9 @@ local HOP = {
     maxHopAttempts = 50,       -- maximum number of servers to try
     perServerDetectTimeout = CFG.detecttimeout, -- seconds to wait in a server for targets to load
     retryTeleportDelay = 2,    -- seconds between teleport retries
+    teleportConfirmTimeout = 8, -- seconds to wait for TeleportInitFailed before assuming success
+    teleportCooldownBase = 15,  -- base cooldown after throttle/timeout
+    teleportCooldownMax = 120,  -- max cooldown seconds
     -- Anti-stall settings
     maxNilPicks = 3,
     clearVisitedOnStall = true,
@@ -96,6 +99,30 @@ local function getRequester()
 end
 
 local requester = getRequester()
+
+-- Teleport throttle/timeout handling
+local teleportBlockedUntil = 0
+local teleportFailCounter = 0
+
+local function scheduleTeleportCooldown(reason)
+    local now = tick()
+    local prev = math.max(0, teleportBlockedUntil - now)
+    local base = HOP.teleportCooldownBase or 15
+    local maxc = HOP.teleportCooldownMax or 120
+    local mult = 1
+    local r = tostring(reason or ""):lower()
+    if r:find("flood") or r:find("timeout") then mult = 2 end
+    local nextDelay = math.min((prev > 0 and prev * 1.5 or base) * mult, maxc)
+    teleportBlockedUntil = now + nextDelay
+    teleportFailCounter = teleportFailCounter + 1
+    warn(string.format("ServerHop: teleport cooldown %.0fs (%s)", nextDelay, tostring(reason)))
+end
+
+pcall(function()
+    TeleportService.TeleportInitFailed:Connect(function(player, result)
+        scheduleTeleportCooldown(result)
+    end)
+end)
 
 -- File helpers (optional)
 local function safeIsFile(path)
@@ -240,20 +267,55 @@ local function mapSproutRarity(name)
     return "Basic"
 end
 
+-- Try to determine sprout rarity from GUI text inside the model, fallback to name
+local function detectSproutRarity(model)
+    if not model or not model.GetDescendants then
+        return "Basic"
+    end
+    local best = mapSproutRarity(model.Name)
+    -- Prefer explicit billboard text if present
+    for _, d in ipairs(model:GetDescendants()) do
+        local ok, text = pcall(function()
+            if d:IsA("TextLabel") or d:IsA("TextButton") then return d.Text end
+        end)
+        if ok and typeof(text) == "string" then
+            local t = string.lower(text)
+            if string.find(t, "supreme") then return "Supreme" end
+            if string.find(t, "legend") then return "Legendary" end
+            if string.find(t, "epic") then return "Epic" end
+            if string.find(t, "gummy") then return "Gummy" end
+            if string.find(t, "moon") then return "Moon" end
+            if string.find(t, "rare") then return "Rare" end
+        end
+    end
+    return best
+end
+
 local function findSprouts()
     local folder = Workspace:FindFirstChild("Sprouts") or Workspace
     local results = {}
+    local seen = {}
     for _, inst in ipairs(folder:GetDescendants()) do
-        if inst:IsA("Model") and string.find(string.lower(inst.Name), "sprout") then
-            local pos = instancePosition(inst)
-            local field = nearestFieldName(pos)
-            local rarity = mapSproutRarity(inst.Name)
-            local allow = CFG.rarity[rarity]
-            if not allow and (rarity == "Epic" or rarity == "Legendary" or rarity == "Supreme") then
-                allow = CFG.rarity["Epic+"]
-            end
-            if allow and not inBlacklist(field) then
-                table.insert(results, { kind = "sprout", rarity = rarity, field = field, pos = pos })
+        local nameLower = string.lower(inst.Name)
+        if (inst:IsA("Model") or inst:IsA("BasePart")) and string.find(nameLower, "sprout") then
+            local key = nil
+            local okK, full = pcall(function() return inst:GetFullName() end)
+            if okK and typeof(full) == "string" then key = full end
+            if key and seen[key] then
+                -- skip duplicates
+            else
+                if key then seen[key] = true end
+                local pos = instancePosition(inst)
+                local field = nearestFieldName(pos)
+                local model = inst:IsA("Model") and inst or inst.Parent
+                local rarity = detectSproutRarity(model or inst)
+                local allow = CFG.rarity[rarity]
+                if not allow and (rarity == "Epic" or rarity == "Legendary" or rarity == "Supreme") then
+                    allow = CFG.rarity["Epic+"]
+                end
+                if allow and not inBlacklist(field) then
+                    table.insert(results, { kind = "sprout", rarity = rarity, field = field, pos = pos })
+                end
             end
         end
     end
@@ -657,14 +719,23 @@ local function hop(placeId)
                 preferLeast = false
             end
             if HOP.forceRandomTeleportOnStall and stallCount >= (HOP.maxNilPicks or 3) then
+                while tick() < teleportBlockedUntil do
+                    task.wait(1)
+                end
+                local before = teleportFailCounter
                 local okTp, err = pcall(function()
-                    -- Client-side fallback: no player argument
                     TeleportService:Teleport(placeId)
                 end)
-                if okTp then
-                    return true
+                if not okTp then
+                    warn("ServerHop: Random teleport error:", err)
+                    scheduleTeleportCooldown(err)
                 else
-                    warn("ServerHop: Random teleport failed:", err)
+                    task.wait(HOP.teleportConfirmTimeout)
+                    if teleportFailCounter == before then
+                        return true
+                    else
+                        warn("ServerHop: Random teleport init failed (event)")
+                    end
                 end
             end
             task.wait(HOP.retryTeleportDelay)
@@ -679,28 +750,50 @@ local function hop(placeId)
 
             local teleported = false
             for t = 1, 3 do
+                while tick() < teleportBlockedUntil do
+                    task.wait(1)
+                end
+                local before = teleportFailCounter
                 local okTp, err = pcall(function()
                     TeleportService:TeleportToPlaceInstance(placeId, id, LocalPlayer)
                 end)
-                if okTp then
-                    teleported = true
-                    break
-                else
-                    warn("ServerHop: Teleport failed:", err)
+                if not okTp then
+                    warn("ServerHop: TeleportToPlaceInstance error:", err)
+                    scheduleTeleportCooldown(err)
                     task.wait(HOP.retryTeleportDelay)
+                else
+                    task.wait(HOP.teleportConfirmTimeout)
+                    if teleportFailCounter == before then
+                        teleported = true
+                        break
+                    else
+                        warn("ServerHop: Teleport init failed (event), retrying...")
+                        task.wait(HOP.retryTeleportDelay)
+                    end
                 end
             end
 
             if not teleported then
                 -- failed to teleport to a specific instance, try generic teleport as fallback
+                while tick() < teleportBlockedUntil do
+                    task.wait(1)
+                end
+                local before2 = teleportFailCounter
                 local okTp2, err2 = pcall(function()
                     TeleportService:Teleport(placeId)
                 end)
-                if okTp2 then
-                    return true
-                else
-                    warn("ServerHop: Fallback Teleport failed:", err2)
+                if not okTp2 then
+                    warn("ServerHop: Fallback Teleport error:", err2)
+                    scheduleTeleportCooldown(err2)
                     task.wait(HOP.retryTeleportDelay)
+                else
+                    task.wait(HOP.teleportConfirmTimeout)
+                    if teleportFailCounter == before2 then
+                        return true
+                    else
+                        warn("ServerHop: Fallback Teleport init failed (event)")
+                        task.wait(HOP.retryTeleportDelay)
+                    end
                 end
             else
                 return true
