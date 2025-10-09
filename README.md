@@ -9,7 +9,7 @@ Core capabilities:
 - Optional in-game notification when a target is found
 - Persists visited JobIds to avoid re-joining the same server
 
-
+s
 ## File(s)
 - serverhop_deobf.lua — main, readable script
 
