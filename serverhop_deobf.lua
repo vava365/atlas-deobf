@@ -46,6 +46,7 @@ local CFG = {
     fireflies = (typeof(_G.fireflies) == "boolean") and _G.fireflies or false,
     webhook = (typeof(_G.webhook) == "string") and _G.webhook or nil,
     notify = (typeof(_G.notify) == "boolean") and _G.notify or true,
+    detecttimeout = tonumber(_G.detecttimeout) or 25,
 
     vicious = (typeof(_G.vicious) == "boolean") and _G.vicious or false,
     giftedonly = (typeof(_G.giftedonly) == "boolean") and _G.giftedonly or false,
@@ -64,7 +65,7 @@ local CFG = {
 local HOP = {
     preferLeastPlayers = true, -- pick least-populated valid server if true, else first available
     maxHopAttempts = 50,       -- maximum number of servers to try
-    perServerDetectTimeout = 25, -- seconds to wait in a server for targets to load
+    perServerDetectTimeout = CFG.detecttimeout, -- seconds to wait in a server for targets to load
     retryTeleportDelay = 2,    -- seconds between teleport retries
     persistenceFile = "serverhop_visited.json",
 }
