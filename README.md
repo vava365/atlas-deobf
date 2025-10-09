@@ -1,6 +1,5 @@
 # Bee Swarm Server Hop (Deobf/Readable)
 
-A readable/reimplementation of a Bee Swarm Simulator server-hopper with optional target detection and notifications.
 
 Core capabilities:
 - Enumerates public servers and teleports to the next suitable one
