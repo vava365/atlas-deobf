@@ -73,6 +73,11 @@ local HOP = {
     maxHopAttempts = 50,       -- maximum number of servers to try
     perServerDetectTimeout = CFG.detecttimeout, -- seconds to wait in a server for targets to load
     retryTeleportDelay = 2,    -- seconds between teleport retries
+    -- Anti-stall settings
+    maxNilPicks = 3,
+    clearVisitedOnStall = true,
+    forceRandomTeleportOnStall = true,
+    maxVisited = 1500,
     persistenceFile = "serverhop_visited.json",
 }
 
@@ -131,6 +136,28 @@ end
 
 local function saveVisited()
     safeWriteFile(HOP.persistenceFile, HttpService:JSONEncode(visited))
+end
+
+local function countVisited()
+    local n = 0
+    for _ in pairs(visited) do n = n + 1 end
+    return n
+end
+
+local function maybeTrimVisited()
+    if countVisited() > (HOP.maxVisited or 1500) then
+        visited = {}
+        saveVisited()
+    end
+end
+
+local function clearVisitedIfStalled(stallCount)
+    if HOP.clearVisitedOnStall and stallCount >= (HOP.maxNilPicks or 3) then
+        visited = {}
+        saveVisited()
+        return true
+    end
+    return false
 end
 
 -- Helpers
@@ -609,6 +636,8 @@ end
 
 local function hop(placeId)
     applyMovementSettings()
+    local stallCount = 0
+    local preferLeast = HOP.preferLeastPlayers
 
     for attempt = 1, HOP.maxHopAttempts do
         -- Scan this server for targets first
@@ -619,14 +648,31 @@ local function hop(placeId)
         end
 
         -- Otherwise, hop to next server
-        local srv = pickServer(placeId, visited, HOP.preferLeastPlayers)
+        local srv = pickServer(placeId, visited, preferLeast)
         if not srv then
-            warn("ServerHop: no suitable server found on attempt", attempt)
+            stallCount = stallCount + 1
+            warn("ServerHop: no suitable server found on attempt", attempt, "stall", stallCount)
+            if clearVisitedIfStalled(stallCount) then
+                warn("ServerHop: cleared visited cache due to stall; switching to first-available mode")
+                preferLeast = false
+            end
+            if HOP.forceRandomTeleportOnStall and stallCount >= (HOP.maxNilPicks or 3) then
+                local okTp, err = pcall(function()
+                    TeleportService:Teleport(placeId, LocalPlayer)
+                end)
+                if okTp then
+                    return true
+                else
+                    warn("ServerHop: Random teleport failed:", err)
+                end
+            end
             task.wait(HOP.retryTeleportDelay)
         else
             local id = srv.id
+            stallCount = 0
             visited[id] = true
             saveVisited()
+            maybeTrimVisited()
 
             warn(string.format("ServerHop: teleporting to %s (%d/%d)", id, srv.playing or -1, srv.maxPlayers or -1))
 
