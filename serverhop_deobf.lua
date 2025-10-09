@@ -672,6 +672,193 @@ local function farmSprout(result)
     end
 end
 
+-- Hive claiming and field navigation
+local function tryFirePrompt(prompt)
+    local ok = pcall(function()
+        if typeof(fireproximityprompt) == "function" then
+            fireproximityprompt(prompt, 1)
+        end
+    end)
+    if not ok then
+        pcall(function()
+            if typeof(fireproximityprompt) == "function" then
+                fireproximityprompt(prompt)
+            end
+        end)
+    end
+end
+
+local function tryClickDetector(cd)
+    pcall(function()
+        if typeof(fireclickdetector) == "function" then
+            fireclickdetector(cd)
+        end
+    end)
+end
+
+-- Identify and move to the player's hive slot
+local function isHiveOwnedByLocal(model)
+    if not model or not model.IsA then return false end
+    -- Attribute based
+    local okA, ownerAttr = pcall(function() return model:GetAttribute("Owner") end)
+    if okA and ownerAttr ~= nil then
+        if ownerAttr == LocalPlayer or ownerAttr == LocalPlayer.Name or ownerAttr == LocalPlayer.DisplayName or ownerAttr == LocalPlayer.UserId then
+            return true
+        end
+    end
+    -- Child Value objects
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("ObjectValue") and string.lower(d.Name):find("owner") then
+            if d.Value == LocalPlayer then return true end
+        elseif d:IsA("StringValue") and string.lower(d.Name):find("owner") then
+            if d.Value == LocalPlayer.Name or d.Value == LocalPlayer.DisplayName then return true end
+        elseif d:IsA("IntValue") and string.lower(d.Name):find("owner") then
+            if tonumber(d.Value) == LocalPlayer.UserId then return true end
+        elseif d:IsA("TextLabel") or d:IsA("TextButton") then
+            local txt = string.lower(d.Text or "")
+            if txt:find(string.lower(LocalPlayer.DisplayName)) or txt:find(string.lower(LocalPlayer.Name)) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function modelPlatformPosition(model)
+    if not model or not model.IsA then return nil end
+    local pp = nil
+    local ok = pcall(function() pp = model.PrimaryPart end)
+    if ok and pp and pp:IsA("BasePart") then return pp.Position end
+    -- Prefer parts named platform/pad
+    local best
+    for _, c in ipairs(model:GetDescendants()) do
+        if c:IsA("BasePart") then
+            local n = string.lower(c.Name)
+            if n:find("platform") or n:find("pad") or n:find("hive") then
+                best = best or c
+            end
+        end
+    end
+    if best then return best.Position end
+    -- Fallback to any BasePart
+    for _, c in ipairs(model:GetDescendants()) do
+        if c:IsA("BasePart") then return c.Position end
+    end
+    return nil
+end
+
+local function findMyHiveSlotPos()
+    local bestModel, bestDist, bestPos
+    local hrp = getHRP()
+    local origin = hrp and hrp.Position or Vector3.new()
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("Model") then
+            local n = string.lower(inst.Name)
+            if n:find("hive") or n:find("honeycomb") then
+                if isHiveOwnedByLocal(inst) then
+                    local pos = modelPlatformPosition(inst)
+                    if pos then
+                        local d = (pos - origin).Magnitude
+                        if not bestDist or d < bestDist then
+                            bestModel, bestDist, bestPos = inst, d, pos
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return bestPos, bestModel
+end
+
+local function goToMyHiveSlot(timeout)
+    local deadline = tick() + (timeout or 8)
+    while tick() < deadline do
+        local pos = findMyHiveSlotPos()
+        if pos then
+            moveToPosition(pos, 10)
+            return true
+        end
+        task.wait(0.5)
+    end
+    return false
+end
+
+local function findNearestClaimInteract()
+    local hrp = getHRP()
+    local origin = hrp and hrp.Position or Vector3.new()
+    local best, bestDist, bestPart
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            local text = string.lower((d.ObjectText or "") .. " " .. (d.ActionText or "") .. " " .. d.Name)
+            if text:find("hive") or text:find("claim") then
+                local part = d.Parent
+                if part and part:IsA("BasePart") then
+                    local pos = part.Position
+                    local dist = (pos - origin).Magnitude
+                    if not best or dist < bestDist then
+                        best, bestDist, bestPart = d, dist, part
+                    end
+                end
+            end
+        elseif d:IsA("ClickDetector") then
+            local name = string.lower(d.Parent and d.Parent.Name or d.Name)
+            if name:find("hive") or name:find("claim") then
+                local part = d.Parent
+                if part and part:IsA("BasePart") then
+                    local pos = part.Position
+                    local dist = (pos - origin).Magnitude
+                    if not best or dist < bestDist then
+                        best, bestDist, bestPart = d, dist, part
+                    end
+                end
+            end
+        end
+    end
+    return best, bestPart
+end
+
+local function claimHive(timeout)
+    -- If already have a hive, just go to it
+    if goToMyHiveSlot(2) then return true end
+    local deadline = tick() + (timeout or 10)
+    while tick() < deadline do
+        local interact, part = findNearestClaimInteract()
+        if interact and part then
+            moveToPosition(part.Position, 6)
+            if interact:IsA("ProximityPrompt") then
+                tryFirePrompt(interact)
+            elseif interact:IsA("ClickDetector") then
+                tryClickDetector(interact)
+            end
+            -- give the game a moment to assign the hive, then go to slot
+            task.wait(1.5)
+            if goToMyHiveSlot(8) then return true end
+        end
+        task.wait(0.5)
+        -- Attempt to locate assigned hive in parallel
+        if goToMyHiveSlot(1) then return true end
+    end
+    return false
+end
+
+local function findZoneByName(name)
+    if not name then return nil end
+    for _, z in ipairs(ZONES) do
+        if z.Name == name then return z end
+    end
+    return nil
+end
+
+local function goToField(result)
+    local targetPos = result and result.pos or nil
+    local zone = result and result.field and findZoneByName(result.field) or nil
+    local zonePos = zone and instancePosition(zone) or nil
+    local dest = zonePos or targetPos
+    if dest then
+        moveToPosition(dest, 12)
+    end
+end
+
 -- Main hop logic
 local function waitForTargets()
     -- Wait some time for assets to spawn, periodically scanning
@@ -680,12 +867,14 @@ local function waitForTargets()
         local found = detectTargets()
         if #found > 0 then
             announceFound(found[1])
-            -- Optional autopilot
+            -- Autopilot flow: claim hive -> go to field -> handle target
             pcall(function()
                 local f = found[1]
-                if f.kind == "vicious" and CFG.autovicious then
+                claimHive(10)
+                goToField(f)
+                if f.kind == "vicious" then
                     engageVicious(f)
-                elseif f.kind == "sprout" and CFG.autosprouts then
+                elseif f.kind == "sprout" then
                     farmSprout(f)
                 end
             end)
@@ -705,8 +894,7 @@ local function hop(placeId)
         -- Scan this server for targets first
         local ok, res = pcall(waitForTargets)
         if ok and res then
-            warn("ServerHop: target found, staying on this server.")
-            return true
+            warn("ServerHop: target handled, hopping to next server.")
         end
 
         -- Otherwise, hop to next server
