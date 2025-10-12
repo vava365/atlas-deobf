@@ -31,6 +31,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local StarterGui = game:GetService("StarterGui")
+local PathfindingService = game:GetService("PathfindingService")
 
 local LocalPlayer = Players.LocalPlayer
 local PLACE_ID = game.PlaceId
@@ -66,6 +67,14 @@ local CFG = {
     windymin = tonumber(_G.windymin) or 1,
     windymax = tonumber(_G.windymax) or 25,
     stopOnInput = (typeof(_G.stopOnInput) == "boolean") and _G.stopOnInput or true,
+    -- movement tuning
+    jumppower = tonumber(_G.jumppower) or nil,
+    jumpheight = tonumber(_G.jumpheight) or nil,
+    hipheight = tonumber(_G.hipheight) or nil,
+    noclip = (typeof(_G.noclip) == "boolean") and _G.noclip or false,
+    usepathfinding = (typeof(_G.usepathfinding) == "boolean") and _G.usepathfinding or true,
+    agentRadius = tonumber(_G.agentRadius) or 4,
+    agentHeight = tonumber(_G.agentHeight) or 6,
 }
 
 -- Server hop behavior config
@@ -202,8 +211,12 @@ local function inBlacklist(fieldName)
     return blacklistSet[fieldName] or false
 end
 
-local function toServerLink(placeId, jobId)
-    return string.format("roblox://placeId=%d&gameInstanceId=%s", tonumber(placeId) or 0, tostring(jobId))
+local function toServerLinks(placeId, jobId)
+    local pid = tonumber(placeId) or 0
+    local jid = tostring(jobId)
+    local http = string.format("https://www.roblox.com/games/start?placeId=%d&gameInstanceId=%s", pid, jid)
+    local proto = string.format("roblox://placeId=%d&gameInstanceId=%s", pid, jid)
+    return http, proto
 end
 
 -- Zones/fields lookup (best-effort)
@@ -465,14 +478,15 @@ local function announceFound(result)
         title = "Target Found"
     end
 
-    local link = toServerLink(PLACE_ID, CURRENT_JOB_ID)
+    local httpLink, protoLink = toServerLinks(PLACE_ID, CURRENT_JOB_ID)
     pushNotification(title, string.format("Field: %s\nJobId: %s", tostring(result.field), tostring(CURRENT_JOB_ID)), 20)
     local embed = {
         username = "BSS ServerHop",
         embeds = {
             {
                 title = title,
-                description = string.format("Field: %s\nJobId: %s\nLink: %s", tostring(result.field), tostring(CURRENT_JOB_ID), link),
+                url = httpLink,
+                description = string.format("Field: %s\nJobId: %s\nJoin: [Click to Join](%s)\nAlt: %s", tostring(result.field), tostring(CURRENT_JOB_ID), httpLink, protoLink),
                 color = 5793266,
                 footer = { text = os.date("!%Y-%m-%d %H:%M:%SZ") .. " UTC" },
             },
@@ -548,12 +562,36 @@ local function ensureCharacter()
     return LocalPlayer.Character
 end
 
+local settingsEnforcerConn
+
+local function enforceHumanoid(hum)
+    if not hum then return end
+    pcall(function()
+        if CFG.walkspeed then hum.WalkSpeed = CFG.walkspeed end
+        if CFG.jumpheight then
+            hum.UseJumpPower = false
+            hum.JumpHeight = CFG.jumpheight
+        elseif CFG.jumppower then
+            hum.UseJumpPower = true
+            hum.JumpPower = CFG.jumppower
+        end
+        if CFG.hipheight then hum.HipHeight = CFG.hipheight end
+    end)
+end
+
 local function applyMovementSettings()
     local char = ensureCharacter()
     local hum = char:FindFirstChildOfClass("Humanoid")
-    if hum and CFG.walkspeed then
-        pcall(function() hum.WalkSpeed = CFG.walkspeed end)
-    end
+    enforceHumanoid(hum)
+    if settingsEnforcerConn then pcall(function() settingsEnforcerConn:Disconnect() end) end
+    local last = 0
+    settingsEnforcerConn = RunService.Heartbeat:Connect(function()
+        local h = getHumanoid()
+        if h and (tick() - last) > 0.75 then
+            enforceHumanoid(h)
+            last = tick()
+        end
+    end)
 end
 
 -- Movement and farming helpers
@@ -593,11 +631,68 @@ pcall(function()
     end)
 end)
 
+local function setCharacterCollide(enabled)
+    local char = LocalPlayer.Character
+    if not char then return end
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") then
+            d.CanCollide = enabled
+        end
+    end
+end
+
+local function moveByPath(pos, timeout)
+    local hum = getHumanoid()
+    local hrp = getHRP()
+    if not hum or not hrp or not pos then return false end
+    local params = {
+        AgentRadius = CFG.agentRadius or 4,
+        AgentHeight = CFG.agentHeight or 6,
+        AgentCanJump = true,
+    }
+    local path = PathfindingService:CreatePath(params)
+    local ok = pcall(function() path:ComputeAsync(hrp.Position, pos) end)
+    if not ok or path.Status ~= Enum.PathStatus.Success then
+        return false
+    end
+    local waypoints = path:GetWaypoints()
+    local t0 = tick()
+    for i, wp in ipairs(waypoints) do
+        if Movement.cancel then return false end
+        if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+        hum:MoveTo(wp.Position)
+        local reached = false
+        local conn = hum.MoveToFinished:Connect(function(r) reached = r end)
+        local st = tick()
+        while (tick() - st) < 3 do
+            if Movement.cancel then break end
+            if (hrp.Position - wp.Position).Magnitude < 3 then reached = true break end
+            task.wait(0.05)
+        end
+        if conn then conn:Disconnect() end
+        if not reached and Movement.cancel then return false end
+        if timeout and (tick() - t0) > timeout then break end
+    end
+    return (hrp.Position - pos).Magnitude < 6
+end
+
 local function moveToPosition(pos, timeout)
     local hum = getHumanoid()
     local hrp = getHRP()
     if not hum or not hrp or not pos then return false end
     beginMovement()
+    if CFG.noclip then setCharacterCollide(false) end
+
+    -- Prefer pathfinding to avoid obstacles
+    if CFG.usepathfinding then
+        local ok = moveByPath(pos, timeout or 8)
+        if ok or Movement.cancel then
+            if CFG.noclip then setCharacterCollide(true) end
+            return ok
+        end
+    end
+
+    -- Fallback simple MoveTo
     local reached = false
     pcall(function()
         if hrp.Anchored then hrp.Anchored = false end
@@ -618,14 +713,16 @@ local function moveToPosition(pos, timeout)
         task.wait(0.1)
     end
     if conn then conn:Disconnect() end
-    if Movement.cancel then return false end
+    if Movement.cancel then if CFG.noclip then setCharacterCollide(true) end return false end
     if not reached then
         -- Fallback: nudge/teleport near the destination to avoid pathing stalls
         pcall(function()
             hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
         end)
+        if CFG.noclip then setCharacterCollide(true) end
         return true
     end
+    if CFG.noclip then setCharacterCollide(true) end
     return true
 end
 
@@ -956,11 +1053,11 @@ local function waitForTargets()
     while tick() < deadline do
         local found = detectTargets()
         if #found > 0 then
-            announceFound(found[1])
-            -- Autopilot flow: claim hive -> go to field -> handle target
+            -- Autopilot flow: first claim hive, then announce and proceed
             pcall(function()
                 local f = found[1]
-                claimHive(10)
+                claimHive(15)
+                announceFound(f)
                 goToField(f)
                 if f.kind == "vicious" then
                     engageVicious(f)
