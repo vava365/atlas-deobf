@@ -32,6 +32,7 @@ local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local StarterGui = game:GetService("StarterGui")
 local PathfindingService = game:GetService("PathfindingService")
+local TweenService = game:GetService("TweenService")
 
 local LocalPlayer = Players.LocalPlayer
 local PLACE_ID = game.PlaceId
@@ -641,6 +642,32 @@ local function setCharacterCollide(enabled)
     end
 end
 
+local function tweenToPosition(pos, studsPerSecond)
+    local hrp = getHRP()
+    if not hrp then return false end
+    local sps = studsPerSecond or (CFG.tweenspeed or 6)
+    local dist = (hrp.Position - pos).Magnitude
+    local dur = math.clamp(dist / math.max(1, sps), 0.05, 8)
+    local tw = TweenService:Create(hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut), { CFrame = CFrame.new(pos) })
+    local done = false
+    local conn
+    conn = tw.Completed:Connect(function()
+        done = true
+    end)
+    tw:Play()
+    local t0 = tick()
+    while not done and (tick() - t0) < (dur + 1) do
+        if Movement.cancel then
+            pcall(function() tw:Cancel() end)
+            break
+        end
+        task.wait(0.05)
+    end
+    if conn then conn:Disconnect() end
+    local hrp2 = getHRP()
+    return (not Movement.cancel) and hrp2 and ((hrp2.Position - pos).Magnitude < 4)
+end
+
 local function moveByPath(pos, timeout)
     local hum = getHumanoid()
     local hrp = getHRP()
@@ -715,12 +742,10 @@ local function moveToPosition(pos, timeout)
     if conn then conn:Disconnect() end
     if Movement.cancel then if CFG.noclip then setCharacterCollide(true) end return false end
     if not reached then
-        -- Fallback: nudge/teleport near the destination to avoid pathing stalls
-        pcall(function()
-            hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
-        end)
+        -- Fallback: tween near the destination to avoid stalls (instead of teleport)
+        local okTw = tweenToPosition(pos + Vector3.new(0, 3, 0), CFG.tweenspeed)
         if CFG.noclip then setCharacterCollide(true) end
-        return true
+        return okTw
     end
     if CFG.noclip then setCharacterCollide(true) end
     return true
@@ -1006,24 +1031,68 @@ end
 local function claimHive(timeout)
     -- If already have a hive, just go to it
     if goToMyHiveSlot(2) then return true end
-    local deadline = tick() + (timeout or 10)
-    while tick() < deadline do
-        if Movement.cancel then return false end
-        local interact, part = findNearestClaimInteract()
-        if interact and part then
-            if not moveToPosition(part.Position, 6) and Movement.cancel then return false end
+    local deadline = tick() + (timeout or 15)
+
+    local function attemptClaim(interact, part)
+        if not interact or not part then return false end
+        -- Ensure close proximity
+        moveToPosition(part.Position + Vector3.new(0, 0, 0), 6)
+        -- Micro-reposition to trigger prompt if needed
+        local offsets = {
+            Vector3.new(2, 0, 0), Vector3.new(-2, 0, 0), Vector3.new(0, 0, 2), Vector3.new(0, 0, -2),
+            Vector3.new(1.5, 0, 1.5), Vector3.new(-1.5, 0, -1.5)
+        }
+        for i = 1, 5 do
+            if Movement.cancel then return false end
             if interact:IsA("ProximityPrompt") then
                 tryFirePrompt(interact)
             elseif interact:IsA("ClickDetector") then
                 tryClickDetector(interact)
             end
-            -- give the game a moment to assign the hive, then go to slot
-            task.wait(1.5)
-            if goToMyHiveSlot(8) then return true end
+            task.wait(0.35)
+            if goToMyHiveSlot(1) then return true end
+            if offsets[i] then
+                moveToPosition(part.Position + offsets[i], 2)
+            end
+        end
+        -- Final short wait then re-check
+        task.wait(0.5)
+        return goToMyHiveSlot(2)
+    end
+
+    while tick() < deadline do
+        if Movement.cancel then return false end
+        -- If hive got assigned mid-loop
+        if goToMyHiveSlot(1) then return true end
+        local interact, part = findNearestClaimInteract()
+        if interact and part then
+            if attemptClaim(interact, part) then
+                return true
+            end
+        else
+            -- No prompt found; try to approach nearest hive platform and re-scan
+            local _, model = findMyHiveSlotPos() -- returns nil unless owned; we use scan below
+            local nearestPlatform, nearestDist
+            for _, inst in ipairs(Workspace:GetDescendants()) do
+                if inst:IsA("Model") then
+                    local n = string.lower(inst.Name)
+                    if n:find("hive") or n:find("honeycomb") then
+                        local p = modelPlatformPosition(inst)
+                        if p then
+                            local d = (p - (getHRP() and getHRP().Position or p)).Magnitude
+                            if not nearestDist or d < nearestDist then
+                                nearestPlatform, nearestDist = p, d
+                            end
+                        end
+                    end
+                end
+            end
+            if nearestPlatform then
+                moveToPosition(nearestPlatform, 8)
+                task.wait(0.5)
+            end
         end
         task.wait(0.5)
-        -- Attempt to locate assigned hive in parallel
-        if goToMyHiveSlot(1) then return true end
     end
     return false
 end
