@@ -65,6 +65,7 @@ local CFG = {
     windy = (typeof(_G.windy) == "boolean") and _G.windy or false,
     windymin = tonumber(_G.windymin) or 1,
     windymax = tonumber(_G.windymax) or 25,
+    stopOnInput = (typeof(_G.stopOnInput) == "boolean") and _G.stopOnInput or true,
 }
 
 -- Server hop behavior config
@@ -568,12 +569,38 @@ local function getHRP()
     return char:FindFirstChild("HumanoidRootPart")
 end
 
+-- Movement control (stop and cancel support)
+local Movement = { cancel = false }
+function stopMovement()
+    Movement.cancel = true
+end
+_G.stopMovement = stopMovement
+local function beginMovement()
+    Movement.cancel = false
+end
+
+-- Optional: cancel movement when player presses movement keys
+pcall(function()
+    local UIS = game:GetService("UserInputService")
+    UIS.InputBegan:Connect(function(input, gp)
+        if not CFG.stopOnInput or gp then return end
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            local k = input.KeyCode
+            if k == Enum.KeyCode.W or k == Enum.KeyCode.A or k == Enum.KeyCode.S or k == Enum.KeyCode.D or k == Enum.KeyCode.Space then
+                stopMovement()
+            end
+        end
+    end)
+end)
+
 local function moveToPosition(pos, timeout)
     local hum = getHumanoid()
     local hrp = getHRP()
     if not hum or not hrp or not pos then return false end
+    beginMovement()
     local reached = false
     pcall(function()
+        if hrp.Anchored then hrp.Anchored = false end
         hum:MoveTo(pos)
     end)
     local conn
@@ -581,7 +608,9 @@ local function moveToPosition(pos, timeout)
         reached = r
     end)
     local t0 = tick()
-    while tick() - t0 < (timeout or 6) and not reached do
+    local maxT = timeout or 6
+    while (tick() - t0) < maxT and not reached do
+        if Movement.cancel then break end
         if (hrp.Position - pos).Magnitude < 3 then
             reached = true
             break
@@ -589,7 +618,15 @@ local function moveToPosition(pos, timeout)
         task.wait(0.1)
     end
     if conn then conn:Disconnect() end
-    return reached
+    if Movement.cancel then return false end
+    if not reached then
+        -- Fallback: nudge/teleport near the destination to avoid pathing stalls
+        pcall(function()
+            hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+        end)
+        return true
+    end
+    return true
 end
 
 local function findNearestToken(center, radius)
@@ -609,15 +646,31 @@ local function findNearestToken(center, radius)
     return nearest
 end
 
+local function countTokensInRadius(center, radius)
+    local folder = Workspace:FindFirstChild("Tokens") or Workspace
+    local count = 0
+    if not center then return 0 end
+    for _, inst in ipairs(folder:GetDescendants()) do
+        if inst:IsA("BasePart") and string.lower(inst.Name) == "token" then
+            local d = (inst.Position - center).Magnitude
+            if d <= (radius or 75) then
+                count = count + 1
+            end
+        end
+    end
+    return count
+end
+
 local function collectTokens(duration, aroundPos, radius)
     local hrp = getHRP()
     local tEnd = tick() + (duration or 10)
     while tick() < tEnd do
+        if Movement.cancel then break end
         local origin = (aroundPos or (hrp and hrp.Position))
         if not origin then break end
         local tok = findNearestToken(origin, radius or CFG.tokenradius)
         if tok and tok:IsA("BasePart") then
-            moveToPosition(tok.Position, 4)
+            if not moveToPosition(tok.Position, 4) and Movement.cancel then break end
         else
             task.wait(0.25)
         end
@@ -643,15 +696,37 @@ local function locateViciousNear(pos)
     return nearest
 end
 
+local function findNearestHazard(center, radius)
+    local nearest, best
+    local r = radius or 25
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            local n = string.lower(inst.Name)
+            if n:find("stinger") or n:find("spike") or n:find("thorn") then
+                local d = (inst.Position - center).Magnitude
+                if d <= r and (not best or d < best) then
+                    nearest, best = inst, d
+                end
+            end
+        end
+    end
+    return nearest
+end
+
 local function engageVicious(result)
     local startPos = result.pos or (getHRP() and getHRP().Position) or Vector3.new()
     local target = locateViciousNear(startPos)
     local tEnd = tick() + (CFG.vicioustime or 180)
     while tick() < tEnd do
+        if Movement.cancel then break end
         if not target or not target.Parent then break end
         local bpos = instancePosition(target)
         if not bpos then break end
-        moveToPosition(bpos, 2)
+        if not moveToPosition(bpos, 2) and Movement.cancel then break end
+        local hz = findNearestHazard(bpos, 30)
+        if hz then
+            moveToPosition(hz.Position, 1.5)
+        end
         collectTokens(1.5, bpos, math.min(50, CFG.tokenradius or 75))
         -- Reacquire in case the model reference changes
         target = locateViciousNear(bpos)
@@ -666,8 +741,20 @@ local function farmSprout(result)
     end
     local duration = CFG.sprouttime or 120
     local tEnd = tick() + duration
+    local emptyStreak = 0
     while tick() < tEnd do
-        collectTokens(2, targetPos or (getHRP() and getHRP().Position) or Vector3.new(), CFG.tokenradius)
+        if Movement.cancel then break end
+        local center = targetPos or (getHRP() and getHRP().Position) or Vector3.new()
+        local count = countTokensInRadius(center, CFG.tokenradius)
+        if count == 0 then
+            emptyStreak = emptyStreak + 1
+        else
+            emptyStreak = 0
+        end
+        collectTokens(2, center, CFG.tokenradius)
+        if emptyStreak >= 8 then -- ~a few cycles with no tokens nearby
+            break
+        end
         task.wait(0.2)
     end
 end
@@ -773,10 +860,12 @@ end
 local function goToMyHiveSlot(timeout)
     local deadline = tick() + (timeout or 8)
     while tick() < deadline do
+        if Movement.cancel then return false end
         local pos = findMyHiveSlotPos()
         if pos then
-            moveToPosition(pos, 10)
-            return true
+            if moveToPosition(pos, 10) then
+                return true
+            end
         end
         task.wait(0.5)
     end
@@ -822,9 +911,10 @@ local function claimHive(timeout)
     if goToMyHiveSlot(2) then return true end
     local deadline = tick() + (timeout or 10)
     while tick() < deadline do
+        if Movement.cancel then return false end
         local interact, part = findNearestClaimInteract()
         if interact and part then
-            moveToPosition(part.Position, 6)
+            if not moveToPosition(part.Position, 6) and Movement.cancel then return false end
             if interact:IsA("ProximityPrompt") then
                 tryFirePrompt(interact)
             elseif interact:IsA("ClickDetector") then
