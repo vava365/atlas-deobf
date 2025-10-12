@@ -336,7 +336,7 @@ local function findSprouts()
                     allow = CFG.rarity["Epic+"]
                 end
                 if allow and not inBlacklist(field) then
-                    table.insert(results, { kind = "sprout", rarity = rarity, field = field, pos = pos })
+                    table.insert(results, { kind = "sprout", rarity = rarity, field = field, pos = pos, model = model })
                 end
             end
         end
@@ -764,11 +764,20 @@ local function moveToPosition(pos, timeout)
     return true
 end
 
+local function isToken(inst)
+    if not inst or not inst.IsA then return false end
+    if inst:IsA("BasePart") then
+        local n = string.lower(inst.Name)
+        return n == "token" or n == "collectible" or n:find("token") ~= nil or n:find("collect") ~= nil
+    end
+    return false
+end
+
 local function findNearestToken(center, radius)
     local folder = Workspace:FindFirstChild("Tokens") or Workspace
     local nearest, bestDist
     for _, inst in ipairs(folder:GetDescendants()) do
-        if inst:IsA("BasePart") and string.lower(inst.Name) == "token" then
+        if isToken(inst) then
             local pos = inst.Position
             local d = (pos - center).Magnitude
             if d <= (radius or 75) then
@@ -786,7 +795,7 @@ local function countTokensInRadius(center, radius)
     local count = 0
     if not center then return 0 end
     for _, inst in ipairs(folder:GetDescendants()) do
-        if inst:IsA("BasePart") and string.lower(inst.Name) == "token" then
+        if isToken(inst) then
             local d = (inst.Position - center).Magnitude
             if d <= (radius or 75) then
                 count = count + 1
@@ -799,15 +808,26 @@ end
 local function collectTokens(duration, aroundPos, radius)
     local hrp = getHRP()
     local tEnd = tick() + (duration or 10)
+    local idleSince = nil
     while tick() < tEnd do
         if Movement.cancel then break end
         local origin = (aroundPos or (hrp and hrp.Position))
         if not origin then break end
         local tok = findNearestToken(origin, radius or CFG.tokenradius)
         if tok and tok:IsA("BasePart") then
+            idleSince = nil
             if not moveToPosition(tok.Position, 4) and Movement.cancel then break end
         else
-            task.wait(0.25)
+            if not idleSince then idleSince = tick() end
+            -- wander a bit to attract/collect nearby tokens
+            if tick() - idleSince > 0.5 then
+                local r = (radius or CFG.tokenradius or 75)
+                local off = Vector3.new(math.random(-r/2, r/2), 0, math.random(-r/2, r/2))
+                moveToPosition(origin + off, 0.6)
+                idleSince = tick()
+            else
+                task.wait(0.15)
+            end
         end
     end
 end
@@ -961,20 +981,20 @@ local function farmSprout(result)
     if targetPos then
         moveToPosition(targetPos, 8)
     end
-    local duration = CFG.sprouttime or 120
+    local duration = CFG.sprouttime or 150
     local tEnd = tick() + duration
-    local emptyStreak = 0
+    local emptyFor = 0
     while tick() < tEnd do
         if Movement.cancel then break end
         local center = targetPos or (getHRP() and getHRP().Position) or Vector3.new()
         local count = countTokensInRadius(center, CFG.tokenradius)
         if count == 0 then
-            emptyStreak = emptyStreak + 1
+            emptyFor = emptyFor + 0.2
         else
-            emptyStreak = 0
+            emptyFor = 0
         end
         collectTokens(2, center, CFG.tokenradius)
-        if emptyStreak >= 8 then -- ~a few cycles with no tokens nearby
+        if emptyFor >= 12 then -- no tokens for ~12s
             break
         end
         task.wait(0.2)
@@ -1003,6 +1023,44 @@ local function tryClickDetector(cd)
             fireclickdetector(cd)
         end
     end)
+end
+
+local function getAncestorHiveModel(part)
+    local p = part
+    for i = 1, 6 do
+        if not p or not p.Parent then break end
+        if p:IsA("Model") then
+            local n = string.lower(p.Name)
+            if n:find("hive") or n:find("honeycomb") then
+                return p
+            end
+        end
+        p = p.Parent
+    end
+    return nil
+end
+
+local function isHiveOwnedByAnyone(model)
+    if not model or not model.IsA then return false end
+    -- Attribute
+    local okA, ownerAttr = pcall(function() return model:GetAttribute("Owner") end)
+    if okA and ownerAttr ~= nil and ownerAttr ~= false and ownerAttr ~= 0 and ownerAttr ~= "" then
+        return true
+    end
+    -- Check children values
+    for _, d in ipairs(model:GetDescendants()) do
+        local nm = string.lower(d.Name)
+        if d:IsA("ObjectValue") and nm:find("owner") and d.Value then return true end
+        if d:IsA("StringValue") and nm:find("owner") and (d.Value and d.Value ~= "") then return true end
+        if d:IsA("IntValue") and nm:find("owner") and tonumber(d.Value or 0) ~= 0 then return true end
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) then
+            local txt = string.lower(d.Text or "")
+            if txt:find("owned") and (not txt:find(string.lower(LocalPlayer.Name))) then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 -- Identify and move to the player's hive slot
@@ -1138,9 +1196,12 @@ local function listClaimInteracts()
             if (text:find("claim") and text:find("hive")) and d.Enabled ~= false then
                 local part = d.Parent
                 if part and part:IsA("BasePart") then
-                    local pos = part.Position
-                    local dist = (pos - origin).Magnitude
-                    table.insert(items, { interact = d, part = part, dist = dist })
+                    local hiveModel = getAncestorHiveModel(part)
+                    if hiveModel and not isHiveOwnedByLocal(hiveModel) and not isHiveOwnedByAnyone(hiveModel) then
+                        local pos = part.Position
+                        local dist = (pos - origin).Magnitude
+                        table.insert(items, { interact = d, part = part, dist = dist })
+                    end
                 end
             end
         elseif d:IsA("ClickDetector") then
@@ -1148,9 +1209,12 @@ local function listClaimInteracts()
             if name:find("hive") or name:find("claim") then
                 local part = d.Parent
                 if part and part:IsA("BasePart") then
-                    local pos = part.Position
-                    local dist = (pos - origin).Magnitude
-                    table.insert(items, { interact = d, part = part, dist = dist })
+                    local hiveModel = getAncestorHiveModel(part)
+                    if hiveModel and not isHiveOwnedByLocal(hiveModel) and not isHiveOwnedByAnyone(hiveModel) then
+                        local pos = part.Position
+                        local dist = (pos - origin).Magnitude
+                        table.insert(items, { interact = d, part = part, dist = dist })
+                    end
                 end
             end
         end
