@@ -76,7 +76,14 @@ local CFG = {
     usepathfinding = (typeof(_G.usepathfinding) == "boolean") and _G.usepathfinding or true,
     agentRadius = tonumber(_G.agentRadius) or 4,
     agentHeight = tonumber(_G.agentHeight) or 6,
+    dodgevicious = (typeof(_G.dodgevicious) == "boolean") and _G.dodgevicious or true,
+    combatradius = tonumber(_G.combatradius) or 8,
 }
+
+-- Movement/dodge constants (not customizable)
+local TWEEN_SPEED = 6
+local COMBAT_RADIUS = 8
+local DODGE_VICIOUS = true
 
 -- Server hop behavior config
 local HOP = {
@@ -645,9 +652,13 @@ end
 local function tweenToPosition(pos, studsPerSecond)
     local hrp = getHRP()
     if not hrp then return false end
-    local sps = studsPerSecond or (CFG.tweenspeed or 6)
+    pcall(function() if hrp.Anchored then hrp.Anchored = false end end)
+    -- Slightly faster than configured speed for responsiveness
+    local sps = 6
     local dist = (hrp.Position - pos).Magnitude
     local dur = math.clamp(dist / math.max(1, sps), 0.05, 8)
+    -- Force noclip during tween to avoid getting stuck
+    setCharacterCollide(false)
     local tw = TweenService:Create(hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut), { CFrame = CFrame.new(pos) })
     local done = false
     local conn
@@ -661,11 +672,13 @@ local function tweenToPosition(pos, studsPerSecond)
             pcall(function() tw:Cancel() end)
             break
         end
-        task.wait(0.05)
+        task.wait(0.03)
     end
     if conn then conn:Disconnect() end
+    -- restore collisions
+    setCharacterCollide(true)
     local hrp2 = getHRP()
-    return (not Movement.cancel) and hrp2 and ((hrp2.Position - pos).Magnitude < 4)
+    return (not Movement.cancel) and hrp2 and ((hrp2.Position - pos).Magnitude < 5)
 end
 
 local function moveByPath(pos, timeout)
@@ -708,13 +721,13 @@ local function moveToPosition(pos, timeout)
     local hrp = getHRP()
     if not hum or not hrp or not pos then return false end
     beginMovement()
-    if CFG.noclip then setCharacterCollide(false) end
+    setCharacterCollide(false)
 
     -- Prefer pathfinding to avoid obstacles
     if CFG.usepathfinding then
         local ok = moveByPath(pos, timeout or 8)
         if ok or Movement.cancel then
-            if CFG.noclip then setCharacterCollide(true) end
+            setCharacterCollide(true)
             return ok
         end
     end
@@ -743,11 +756,11 @@ local function moveToPosition(pos, timeout)
     if Movement.cancel then if CFG.noclip then setCharacterCollide(true) end return false end
     if not reached then
         -- Fallback: tween near the destination to avoid stalls (instead of teleport)
-        local okTw = tweenToPosition(pos + Vector3.new(0, 3, 0), CFG.tweenspeed)
-        if CFG.noclip then setCharacterCollide(true) end
+        local okTw = tweenToPosition(pos + Vector3.new(0, 3, 0), TWEEN_SPEED)
+        setCharacterCollide(true)
         return okTw
     end
-    if CFG.noclip then setCharacterCollide(true) end
+    setCharacterCollide(true)
     return true
 end
 
@@ -799,23 +812,56 @@ local function collectTokens(duration, aroundPos, radius)
     end
 end
 
+local function modelHasUnanchoredPart(model)
+    local ok, res = pcall(function()
+        for _, d in ipairs(model:GetDescendants()) do
+            if d:IsA("BasePart") and d.Anchored == false then
+                return true
+            end
+        end
+        return false
+    end)
+    return ok and res or false
+end
+
+local function getModelRootPosition(model)
+    local pos
+    local ok = pcall(function()
+        if model.PrimaryPart then pos = model.PrimaryPart.Position end
+    end)
+    if pos then return pos end
+    local hrp = model:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp:IsA("BasePart") then return hrp.Position end
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") then return d.Position end
+    end
+    return nil
+end
+
+local function isActiveVicious(model)
+    if not model or not model.IsA or not model:IsA("Model") then return false end
+    local n = string.lower(model.Name)
+    if not (n:find("vicious") and n:find("bee")) then return false end
+    -- Heuristics: active mob has unanchored parts or a humanoid root
+    if model:FindFirstChild("Humanoid") or model:FindFirstChild("HumanoidRootPart") then return true end
+    if modelHasUnanchoredPart(model) then return true end
+    return false
+end
+
 local function locateViciousNear(pos)
-    local nearest, best = nil, math.huge
+    local nearestActive, bestA = nil, math.huge
     for _, inst in ipairs(Workspace:GetDescendants()) do
-        if inst:IsA("Model") then
-            local name = string.lower(inst.Name)
-            if string.find(name, "vicious") and string.find(name, "bee") then
-                local ip = instancePosition(inst)
-                if ip then
-                    local d = (ip - pos).Magnitude
-                    if d < best then
-                        nearest, best = inst, d
-                    end
+        if inst:IsA("Model") and isActiveVicious(inst) then
+            local ip = getModelRootPosition(inst) or instancePosition(inst)
+            if ip then
+                local d = (ip - pos).Magnitude
+                if d < bestA then
+                    nearestActive, bestA = inst, d
                 end
             end
         end
     end
-    return nearest
+    return nearestActive
 end
 
 local function findNearestHazard(center, radius)
@@ -835,25 +881,79 @@ local function findNearestHazard(center, radius)
     return nearest
 end
 
+local function findThreatNear(center, radius)
+    local r = radius or 12
+    local names = {"stinger", "spike", "thorn", "triangle", "shock", "shockwave"}
+    local nearest, best
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            local n = string.lower(inst.Name)
+            for _, k in ipairs(names) do
+                if n:find(k) then
+                    local d = (inst.Position - center).Magnitude
+                    if d <= r and (not best or d < best) then
+                        nearest, best = inst, d
+                    end
+                    break
+                end
+            end
+        end
+    end
+    return nearest
+end
+
 local function engageVicious(result)
     local startPos = result.pos or (getHRP() and getHRP().Position) or Vector3.new()
     local target = locateViciousNear(startPos)
     local tEnd = tick() + (CFG.vicioustime or 180)
+    local orbitAngle = 0
     while tick() < tEnd do
         if Movement.cancel then break end
         if not target or not target.Parent then break end
-        local bpos = instancePosition(target)
+        if not isActiveVicious(target) then break end
+        local bpos = getModelRootPosition(target) or instancePosition(target)
         if not bpos then break end
-        if not moveToPosition(bpos, 2) and Movement.cancel then break end
-        local hz = findNearestHazard(bpos, 30)
-        if hz then
-            moveToPosition(hz.Position, 1.5)
+
+        local hrp = getHRP()
+        if not hrp then break end
+        local me = hrp.Position
+        local dir = (me - bpos)
+        local dist = math.max(1, dir.Magnitude)
+        local desired = COMBAT_RADIUS
+
+        -- Dodge hazards if close
+        if DODGE_VICIOUS then
+            local threat = findThreatNear(me, 12)
+            if threat then
+                local away = (me - threat.Position)
+                local step = away.Magnitude > 0 and away.Unit * 12 or Vector3.new(6, 0, 0)
+                local evadePos = me + step
+                moveToPosition(evadePos, 0.8)
+            end
         end
-        collectTokens(1.5, bpos, math.min(50, CFG.tokenradius or 75))
-        -- Reacquire in case the model reference changes
+
+        -- Maintain an orbit around the bee to reduce hits
+        orbitAngle = (orbitAngle + 0.35) % (math.pi * 2)
+        local flatDir = Vector3.new(dir.X, 0, dir.Z)
+        local baseDir = flatDir.Magnitude > 0 and flatDir.Unit or Vector3.new(1, 0, 0)
+        local ox = math.cos(orbitAngle)
+        local oz = math.sin(orbitAngle)
+        local orbitDir = (Vector3.new(baseDir.X, 0, baseDir.Z) * ox + Vector3.new(-baseDir.Z, 0, baseDir.X) * oz).Unit
+        local targetPos
+        if dist > desired + 2 then
+            targetPos = bpos + orbitDir * desired
+        elseif dist < desired - 2 then
+            targetPos = bpos + orbitDir * desired
+        else
+            targetPos = bpos + orbitDir * desired
+        end
+        moveToPosition(targetPos, 1.1)
+
+        collectTokens(1.2, bpos, math.min(50, CFG.tokenradius or 75))
+        -- Reacquire in case the model reference changes, and avoid static map objects
         target = locateViciousNear(bpos)
     end
-    collectTokens(10, (getHRP() and getHRP().Position) or startPos, CFG.tokenradius)
+    collectTokens(6, (getHRP() and getHRP().Position) or startPos, CFG.tokenradius)
 end
 
 local function farmSprout(result)
@@ -1001,7 +1101,7 @@ local function findNearestClaimInteract()
     for _, d in ipairs(Workspace:GetDescendants()) do
         if d:IsA("ProximityPrompt") then
             local text = string.lower((d.ObjectText or "") .. " " .. (d.ActionText or "") .. " " .. d.Name)
-            if text:find("hive") or text:find("claim") then
+            if (text:find("claim") and text:find("hive")) and d.Enabled ~= false then
                 local part = d.Parent
                 if part and part:IsA("BasePart") then
                     local pos = part.Position
@@ -1026,6 +1126,37 @@ local function findNearestClaimInteract()
         end
     end
     return best, bestPart
+end
+
+local function listClaimInteracts()
+    local hrp = getHRP()
+    local origin = hrp and hrp.Position or Vector3.new()
+    local items = {}
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            local text = string.lower((d.ObjectText or "") .. " " .. (d.ActionText or "") .. " " .. d.Name)
+            if (text:find("claim") and text:find("hive")) and d.Enabled ~= false then
+                local part = d.Parent
+                if part and part:IsA("BasePart") then
+                    local pos = part.Position
+                    local dist = (pos - origin).Magnitude
+                    table.insert(items, { interact = d, part = part, dist = dist })
+                end
+            end
+        elseif d:IsA("ClickDetector") then
+            local name = string.lower(d.Parent and d.Parent.Name or d.Name)
+            if name:find("hive") or name:find("claim") then
+                local part = d.Parent
+                if part and part:IsA("BasePart") then
+                    local pos = part.Position
+                    local dist = (pos - origin).Magnitude
+                    table.insert(items, { interact = d, part = part, dist = dist })
+                end
+            end
+        end
+    end
+    table.sort(items, function(a,b) return a.dist < b.dist end)
+    return items
 end
 
 local function claimHive(timeout)
@@ -1064,14 +1195,16 @@ local function claimHive(timeout)
         if Movement.cancel then return false end
         -- If hive got assigned mid-loop
         if goToMyHiveSlot(1) then return true end
-        local interact, part = findNearestClaimInteract()
-        if interact and part then
-            if attemptClaim(interact, part) then
-                return true
+        local items = listClaimInteracts()
+        if #items > 0 then
+            for _, it in ipairs(items) do
+                if Movement.cancel then return false end
+                if attemptClaim(it.interact, it.part) then
+                    return true
+                end
             end
         else
             -- No prompt found; try to approach nearest hive platform and re-scan
-            local _, model = findMyHiveSlotPos() -- returns nil unless owned; we use scan below
             local nearestPlatform, nearestDist
             for _, inst in ipairs(Workspace:GetDescendants()) do
                 if inst:IsA("Model") then
@@ -1092,7 +1225,7 @@ local function claimHive(timeout)
                 task.wait(0.5)
             end
         end
-        task.wait(0.5)
+        task.wait(0.4)
     end
     return false
 end
