@@ -1025,6 +1025,67 @@ local function tryClickDetector(cd)
     end)
 end
 
+-- GUI-based hive claim support
+local function isGuiObjectVisible(obj)
+    local current = obj
+    while current do
+        if current:IsA("GuiObject") then
+            if current.Visible == false then return false end
+        elseif current:IsA("ScreenGui") then
+            if current.Enabled == false then return false end
+        end
+        current = current.Parent
+    end
+    return true
+end
+
+local function findClaimGuiButtons()
+    local buttons = {}
+    local function scan(root)
+        local ok, list = pcall(function() return root and root:GetDescendants() end)
+        if not ok or not list then return end
+        for _, d in ipairs(list) do
+            if d:IsA("TextButton") or d:IsA("ImageButton") then
+                local txt = string.lower((d.Text or d.Name or ""))
+                if txt:find("claim") and txt:find("hive") and isGuiObjectVisible(d) then
+                    table.insert(buttons, d)
+                end
+            end
+        end
+    end
+    pcall(function() scan(LocalPlayer:WaitForChild("PlayerGui", 1)) end)
+    pcall(function() scan(game:GetService("CoreGui")) end)
+    return buttons
+end
+
+local function clickGuiButton(btn)
+    local clicked = false
+    pcall(function()
+        if typeof(firesignal) == "function" then
+            if btn.MouseButton1Click then firesignal(btn.MouseButton1Click) clicked = true end
+            if btn.Activated then firesignal(btn.Activated) clicked = true end
+        end
+    end)
+    if clicked then return true end
+    local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
+    local ok = pcall(function()
+        local VIM = game:GetService("VirtualInputManager")
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+    end)
+    return ok
+end
+
+local function tryGuiClaim()
+    local list = findClaimGuiButtons()
+    for _, b in ipairs(list) do
+        clickGuiButton(b)
+        task.wait(0.25)
+        if goToMyHiveSlot(1) then return true end
+    end
+    return false
+end
+
 local function getAncestorHiveModel(part)
     local p = part
     for i = 1, 6 do
@@ -1232,6 +1293,8 @@ local function claimHive(timeout)
         if not interact or not part then return false end
         -- Ensure close proximity
         moveToPosition(part.Position + Vector3.new(0, 0, 0), 6)
+        -- Try GUI claim if present
+        if tryGuiClaim() then return true end
         -- Micro-reposition to trigger prompt if needed
         local offsets = {
             Vector3.new(2, 0, 0), Vector3.new(-2, 0, 0), Vector3.new(0, 0, 2), Vector3.new(0, 0, -2),
@@ -1244,6 +1307,8 @@ local function claimHive(timeout)
             elseif interact:IsA("ClickDetector") then
                 tryClickDetector(interact)
             end
+            -- Try clicking GUI claim button as well
+            if tryGuiClaim() then return true end
             task.wait(0.35)
             if goToMyHiveSlot(1) then return true end
             if offsets[i] then
@@ -1259,6 +1324,11 @@ local function claimHive(timeout)
         if Movement.cancel then return false end
         -- If hive got assigned mid-loop
         if goToMyHiveSlot(1) then return true end
+        -- Attempt GUI claim first
+        for i=1,3 do
+            if tryGuiClaim() then return true end
+            task.wait(0.2)
+        end
         local items = listClaimInteracts()
         if #items > 0 then
             for _, it in ipairs(items) do
@@ -1286,7 +1356,10 @@ local function claimHive(timeout)
             end
             if nearestPlatform then
                 moveToPosition(nearestPlatform, 8)
-                task.wait(0.5)
+                task.wait(0.3)
+                -- After moving near hives, try GUI claim again
+                if tryGuiClaim() then return true end
+                task.wait(0.2)
             end
         end
         task.wait(0.4)
