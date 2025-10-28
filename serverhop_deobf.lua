@@ -88,7 +88,7 @@ local DODGE_VICIOUS = true
 -- Server hop behavior config
 local HOP = {
     preferLeastPlayers = true, -- pick least-populated valid server if true, else first available
-    maxHopAttempts = 50,       -- maximum number of servers to try
+    maxHopAttempts = 999999,       -- maximum number of servers to try
     perServerDetectTimeout = CFG.detecttimeout, -- seconds to wait in a server for targets to load
     retryTeleportDelay = 2,    -- seconds between teleport retries
     teleportConfirmTimeout = 8, -- seconds to wait for TeleportInitFailed before assuming success
