@@ -1,4 +1,4 @@
-# Bee Swarm Server Hop (Deobf/Readable)
+# Bee Swarm Server Hop
 
 
 Core capabilities:
@@ -8,10 +8,6 @@ Core capabilities:
 - Optional Discord webhook when a target is found
 - Optional in-game notification when a target is found
 - Persists visited JobIds to avoid re-joining the same server
-
-
-## File(s)
-- serverhop_deobf.lua — main, readable script
 
 
 ## Requirements
