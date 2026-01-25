@@ -1386,9 +1386,11 @@ local function goToField(result)
 end
 
 -- Main hop logic
-local function waitForTargets()
+local function waitForTargets(autoMode)
     -- Wait some time for assets to spawn, periodically scanning
     local deadline = tick() + HOP.perServerDetectTimeout
+    local farmedCount = 0
+    local maxAutoFarms = 10  -- Limit auto farms per server to prevent infinite loops
     while tick() < deadline do
         local found = detectTargets()
         if #found > 0 then
@@ -1404,9 +1406,15 @@ local function waitForTargets()
                     farmSprout(f)
                 end
             end)
-            return true, found
+            farmedCount = farmedCount + 1
+            if not autoMode or farmedCount >= maxAutoFarms then
+                return true, found
+            end
+            -- In auto mode, continue scanning after farming
+            task.wait(2)  -- Short delay before next scan
+        else
+            task.wait(1)
         end
-        task.wait(1)
     end
     return false, nil
 end
@@ -1417,100 +1425,199 @@ local function hop(placeId)
     local preferLeast = HOP.preferLeastPlayers
 
     for attempt = 1, HOP.maxHopAttempts do
+        -- Check if auto mode is enabled
+        local autoMode = CFG.autovicious or CFG.autosprouts
         -- Scan this server for targets first
-        local ok, res = pcall(waitForTargets)
+        local ok, res = pcall(waitForTargets, autoMode)
         if ok and res then
-            warn("ServerHop: target handled, hopping to next server.")
+            if autoMode then
+                warn("ServerHop: auto farming completed in server, hopping to next.")
+            else
+                warn("ServerHop: target handled, hopping to next server.")
+            end
         end
 
-        -- Otherwise, hop to next server
-        local srv = pickServer(placeId, visited, preferLeast)
-        if not srv then
-            stallCount = stallCount + 1
-            warn("ServerHop: no suitable server found on attempt", attempt, "stall", stallCount)
-            if clearVisitedIfStalled(stallCount) then
-                warn("ServerHop: cleared visited cache due to stall; switching to first-available mode")
-                preferLeast = false
-            end
-            if HOP.forceRandomTeleportOnStall and stallCount >= (HOP.maxNilPicks or 3) then
-                while tick() < teleportBlockedUntil do
-                    task.wait(1)
+        -- If not in auto mode or after auto farming, hop to next server
+        if not autoMode then
+            local srv = pickServer(placeId, visited, preferLeast)
+            if not srv then
+                stallCount = stallCount + 1
+                warn("ServerHop: no suitable server found on attempt", attempt, "stall", stallCount)
+                if clearVisitedIfStalled(stallCount) then
+                    warn("ServerHop: cleared visited cache due to stall; switching to first-available mode")
+                    preferLeast = false
                 end
-                local before = teleportFailCounter
-                local okTp, err = pcall(function()
-                    TeleportService:Teleport(placeId)
-                end)
-                if not okTp then
-                    warn("ServerHop: Random teleport error:", err)
-                    scheduleTeleportCooldown(err)
-                else
-                    task.wait(HOP.teleportConfirmTimeout)
-                    if teleportFailCounter == before then
-                        return true
+                if HOP.forceRandomTeleportOnStall and stallCount >= (HOP.maxNilPicks or 3) then
+                    while tick() < teleportBlockedUntil do
+                        task.wait(1)
+                    end
+                    local before = teleportFailCounter
+                    local okTp, err = pcall(function()
+                        TeleportService:Teleport(placeId)
+                    end)
+                    if not okTp then
+                        warn("ServerHop: Random teleport error:", err)
+                        scheduleTeleportCooldown(err)
                     else
-                        warn("ServerHop: Random teleport init failed (event)")
+                        task.wait(HOP.teleportConfirmTimeout)
+                        if teleportFailCounter == before then
+                            return true
+                        else
+                            warn("ServerHop: Random teleport init failed (event)")
+                        end
                     end
                 end
-            end
-            task.wait(HOP.retryTeleportDelay)
-        else
-            local id = srv.id
-            stallCount = 0
-            visited[id] = true
-            saveVisited()
-            maybeTrimVisited()
-
-            warn(string.format("ServerHop: teleporting to %s (%d/%d)", id, srv.playing or -1, srv.maxPlayers or -1))
-
-            local teleported = false
-            for t = 1, 3 do
-                while tick() < teleportBlockedUntil do
-                    task.wait(1)
-                end
-                local before = teleportFailCounter
-                local okTp, err = pcall(function()
-                    TeleportService:TeleportToPlaceInstance(placeId, id, LocalPlayer)
-                end)
-                if not okTp then
-                    warn("ServerHop: TeleportToPlaceInstance error:", err)
-                    scheduleTeleportCooldown(err)
-                    task.wait(HOP.retryTeleportDelay)
-                else
-                    task.wait(HOP.teleportConfirmTimeout)
-                    if teleportFailCounter == before then
-                        teleported = true
-                        break
-                    else
-                        warn("ServerHop: Teleport init failed (event), retrying...")
-                        task.wait(HOP.retryTeleportDelay)
-                    end
-                end
-            end
-
-            if not teleported then
-                -- failed to teleport to a specific instance, try generic teleport as fallback
-                while tick() < teleportBlockedUntil do
-                    task.wait(1)
-                end
-                local before2 = teleportFailCounter
-                local okTp2, err2 = pcall(function()
-                    TeleportService:Teleport(placeId)
-                end)
-                if not okTp2 then
-                    warn("ServerHop: Fallback Teleport error:", err2)
-                    scheduleTeleportCooldown(err2)
-                    task.wait(HOP.retryTeleportDelay)
-                else
-                    task.wait(HOP.teleportConfirmTimeout)
-                    if teleportFailCounter == before2 then
-                        return true
-                    else
-                        warn("ServerHop: Fallback Teleport init failed (event)")
-                        task.wait(HOP.retryTeleportDelay)
-                    end
-                end
+                task.wait(HOP.retryTeleportDelay)
             else
-                return true
+                local id = srv.id
+                stallCount = 0
+                visited[id] = true
+                saveVisited()
+                maybeTrimVisited()
+
+                warn(string.format("ServerHop: teleporting to %s (%d/%d)", id, srv.playing or -1, srv.maxPlayers or -1))
+
+                local teleported = false
+                for t = 1, 3 do
+                    while tick() < teleportBlockedUntil do
+                        task.wait(1)
+                    end
+                    local before = teleportFailCounter
+                    local okTp, err = pcall(function()
+                        TeleportService:TeleportToPlaceInstance(placeId, id, LocalPlayer)
+                    end)
+                    if not okTp then
+                        warn("ServerHop: TeleportToPlaceInstance error:", err)
+                        scheduleTeleportCooldown(err)
+                        task.wait(HOP.retryTeleportDelay)
+                    else
+                        task.wait(HOP.teleportConfirmTimeout)
+                        if teleportFailCounter == before then
+                            teleported = true
+                            break
+                        else
+                            warn("ServerHop: Teleport init failed (event), retrying...")
+                            task.wait(HOP.retryTeleportDelay)
+                        end
+                    end
+                end
+
+                if not teleported then
+                    -- failed to teleport to a specific instance, try generic teleport as fallback
+                    while tick() < teleportBlockedUntil do
+                        task.wait(1)
+                    end
+                    local before2 = teleportFailCounter
+                    local okTp2, err2 = pcall(function()
+                        TeleportService:Teleport(placeId)
+                    end)
+                    if not okTp2 then
+                        warn("ServerHop: Fallback Teleport error:", err2)
+                        scheduleTeleportCooldown(err2)
+                        task.wait(HOP.retryTeleportDelay)
+                    else
+                        task.wait(HOP.teleportConfirmTimeout)
+                        if teleportFailCounter == before2 then
+                            return true
+                        else
+                            warn("ServerHop: Fallback Teleport init failed (event)")
+                            task.wait(HOP.retryTeleportDelay)
+                        end
+                    end
+                else
+                    return true
+                end
+            end
+        else
+            -- In auto mode, we've already farmed in this server, so hop now
+            local srv = pickServer(placeId, visited, preferLeast)
+            if not srv then
+                stallCount = stallCount + 1
+                warn("ServerHop: no suitable server found on attempt", attempt, "stall", stallCount)
+                if clearVisitedIfStalled(stallCount) then
+                    warn("ServerHop: cleared visited cache due to stall; switching to first-available mode")
+                    preferLeast = false
+                end
+                if HOP.forceRandomTeleportOnStall and stallCount >= (HOP.maxNilPicks or 3) then
+                    while tick() < teleportBlockedUntil do
+                        task.wait(1)
+                    end
+                    local before = teleportFailCounter
+                    local okTp, err = pcall(function()
+                        TeleportService:Teleport(placeId)
+                    end)
+                    if not okTp then
+                        warn("ServerHop: Random teleport error:", err)
+                        scheduleTeleportCooldown(err)
+                    else
+                        task.wait(HOP.teleportConfirmTimeout)
+                        if teleportFailCounter == before then
+                            return true
+                        else
+                            warn("ServerHop: Random teleport init failed (event)")
+                        end
+                    end
+                end
+                task.wait(HOP.retryTeleportDelay)
+            else
+                local id = srv.id
+                stallCount = 0
+                visited[id] = true
+                saveVisited()
+                maybeTrimVisited()
+
+                warn(string.format("ServerHop: teleporting to %s (%d/%d)", id, srv.playing or -1, srv.maxPlayers or -1))
+
+                local teleported = false
+                for t = 1, 3 do
+                    while tick() < teleportBlockedUntil do
+                        task.wait(1)
+                    end
+                    local before = teleportFailCounter
+                    local okTp, err = pcall(function()
+                        TeleportService:TeleportToPlaceInstance(placeId, id, LocalPlayer)
+                    end)
+                    if not okTp then
+                        warn("ServerHop: TeleportToPlaceInstance error:", err)
+                        scheduleTeleportCooldown(err)
+                        task.wait(HOP.retryTeleportDelay)
+                    else
+                        task.wait(HOP.teleportConfirmTimeout)
+                        if teleportFailCounter == before then
+                            teleported = true
+                            break
+                        else
+                            warn("ServerHop: Teleport init failed (event), retrying...")
+                            task.wait(HOP.retryTeleportDelay)
+                        end
+                    end
+                end
+
+                if not teleported then
+                    -- failed to teleport to a specific instance, try generic teleport as fallback
+                    while tick() < teleportBlockedUntil do
+                        task.wait(1)
+                    end
+                    local before2 = teleportFailCounter
+                    local okTp2, err2 = pcall(function()
+                        TeleportService:Teleport(placeId)
+                    end)
+                    if not okTp2 then
+                        warn("ServerHop: Fallback Teleport error:", err2)
+                        scheduleTeleportCooldown(err2)
+                        task.wait(HOP.retryTeleportDelay)
+                    else
+                        task.wait(HOP.teleportConfirmTimeout)
+                        if teleportFailCounter == before2 then
+                            return true
+                        else
+                            warn("ServerHop: Fallback Teleport init failed (event)")
+                            task.wait(HOP.retryTeleportDelay)
+                        end
+                    end
+                else
+                    return true
+                end
             end
         end
     end
