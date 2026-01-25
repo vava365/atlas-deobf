@@ -1387,6 +1387,10 @@ end
 
 -- Main hop logic
 local function waitForTargets(autoMode)
+    -- Check if the server is full (max 6 players in BSS); if so, hop immediately
+    if #Players:GetPlayers() >= 6 then
+        return false, nil
+    end
     -- Wait some time for assets to spawn, periodically scanning
     local deadline = tick() + HOP.perServerDetectTimeout
     local farmedCount = 0
@@ -1452,6 +1456,7 @@ local function hop(placeId)
                         task.wait(1)
                     end
                     local before = teleportFailCounter
+                    local originalJobId = CURRENT_JOB_ID
                     local okTp, err = pcall(function()
                         TeleportService:Teleport(placeId)
                     end)
@@ -1461,7 +1466,13 @@ local function hop(placeId)
                     else
                         task.wait(HOP.teleportConfirmTimeout)
                         if teleportFailCounter == before then
-                            return true
+                            -- Check if we rejoined the same server; if so, continue loop to try again
+                            if game.JobId == originalJobId then
+                                warn("ServerHop: Rejoined same server, retrying hop.")
+                                task.wait(HOP.retryTeleportDelay)
+                            else
+                                return true
+                            end
                         else
                             warn("ServerHop: Random teleport init failed (event)")
                         end
@@ -1543,6 +1554,7 @@ local function hop(placeId)
                         task.wait(1)
                     end
                     local before = teleportFailCounter
+                    local originalJobId = CURRENT_JOB_ID
                     local okTp, err = pcall(function()
                         TeleportService:Teleport(placeId)
                     end)
@@ -1552,7 +1564,13 @@ local function hop(placeId)
                     else
                         task.wait(HOP.teleportConfirmTimeout)
                         if teleportFailCounter == before then
-                            return true
+                            -- Check if we rejoined the same server; if so, continue loop to try again
+                            if game.JobId == originalJobId then
+                                warn("ServerHop: Rejoined same server, retrying hop.")
+                                task.wait(HOP.retryTeleportDelay)
+                            else
+                                return true
+                            end
                         else
                             warn("ServerHop: Random teleport init failed (event)")
                         end
